@@ -63,11 +63,11 @@ function gloebit_http($method, $url, array $headers = array(), $body = null) {
     $resp = curl_exec($ch);
     if ($resp === false) {
         $err = curl_error($ch);
-        curl_close($ch);
         throw new RuntimeException('curl error requesting ' . $url . ': ' . $err);
     }
     $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
+    // No curl_close(): it's a no-op since PHP 8.0 and deprecated in 8.5; the
+    // handle is freed automatically when $ch goes out of scope.
     return array($status, $resp);
 }
 
