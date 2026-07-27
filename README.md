@@ -5,8 +5,8 @@ A minimal PHP interface to [Gloebit](https://www.gloebit.com/)'s API.
 
 `gloebit-php-example.php` demonstrates the OAuth2 **authorization-code** flow:
 it sends the user to Gloebit to authorize, exchanges the returned code for an
-access token, and calls two protected endpoints (`/id` and `/balance`) with that
-token. It's dependency-free (plain `curl` + JSON) and targets **production**
+access token, and calls two protected endpoints (`/user` and `/balance`) with
+that token. It's dependency-free (plain `curl` + JSON) and targets **production**
 (`https://www.gloebit.com`).
 
 > This example is a **base to build on**. It covers authentication and two
@@ -50,7 +50,7 @@ php -S localhost:8000
 
 Then open <http://localhost:8000/gloebit-php-example.php>. You'll be redirected
 to Gloebit to authorize, then returned to the page, which prints the access
-token and the `/id` and `/balance` responses.
+token and the `/user` and `/balance` responses.
 
 How it works
 ------------
@@ -62,41 +62,43 @@ How it works
    and the returned `code`. Gloebit reads `client_id`, `client_secret`, and
    `scope` from the **POST body** (not an HTTP Basic header).
 3. **Call the API** — send `Authorization: Bearer <access_token>` to protected
-   endpoints (here, `GET /id` and `GET /balance`).
+   endpoints (here, `GET /user` and `GET /balance`).
 
 Scopes
 ------
 
 Request only what you need (space-separated in `scope`):
 
-| Scope       | Grants access to                                   |
-|-------------|----------------------------------------------------|
-| `id`        | `/id` — the user's identifying info (name)          |
-| `balance`   | `/balance` — the user's gloebit balance             |
+| Scope       | Grants access to                                         |
+|-------------|----------------------------------------------------------|
+| `balance`   | `/balance` — the user's gloebit balance                  |
 | `transact`  | `/transact`, `/transact-u2u` — **charge / move gloebits** |
-| `user`      | `/user-details` — gloebit user id only (less identifying) |
-| `inventory` | inventory items (legacy)                            |
-| `character` | character management (legacy)                       |
+| `user`      | `/user` — the user's Gloebit user id                     |
+| `inventory` | inventory items (legacy)                                 |
+| `character` | character management (legacy)                            |
+| `id`        | `/id` — **DEPRECATED, do not use** (triggers the legacy character step) |
 
-A payment integration (Blesta, etc.) typically wants **`balance transact`** (and
-`id` if you want the payer's name). This example requests `id balance`.
+A payment integration (Blesta, etc.) typically wants **`balance transact`** (plus
+`user` if you want to identify the payer). This example requests `user balance`.
 
-App-user identity (`user` / `uid`) — and the "character" prompt
---------------------------------------------------------------
+> **Avoid the `id` scope.** It's deprecated, and requesting it makes the authorize
+> flow show a legacy "Edit character" page. Use `user` for identity instead.
 
-Gloebit associates each of your users with an **app-user** (historically called a
-"character") keyed on `(your app, uid)`. Pass, in the authorize request:
+App-user identity (`user` / `uid`)
+----------------------------------
+
+Pass, in the authorize request, your application's own identity for the end user:
 
 - **`uid`** — a **stable identifier that is unique per app-user** (e.g. your
-  Blesta client id). **Never reuse one value across users**: the app-user is keyed
-  on `(app, uid)`, so a second user authorizing with the same `uid` would try to
-  link to the first user's app-user and the authorization **fails**. Do not
-  hardcode a shared constant in production.
+  Blesta client id). Gloebit links your app-user to their Gloebit account keyed on
+  `(your app, uid)`, so **never reuse one value across users** — a second user
+  authorizing with the same `uid` would try to link to the first user's app-user
+  and the authorization **fails**. Do not hardcode a shared constant in production.
 - **`user`** — a display name for that app-user.
 
-Passing both makes Gloebit **auto-associate the app-user and skip its interactive
-"create a character" step** (this is how the OpenSim module passes the avatar).
-Omit them and Gloebit prompts the user to create a character on first authorize.
+This is how the OpenSim module passes the avatar. It establishes the app-user link
+that transactions attribute to; it is **not** what controls the character prompt
+(that's the deprecated `id` scope — see above).
 
 Next: payments (transaction API)
 --------------------------------

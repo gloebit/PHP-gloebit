@@ -5,7 +5,7 @@
  * Demonstrates the OAuth2 authorization-code flow against Gloebit:
  *   1. redirect the user to Gloebit to authorize,
  *   2. exchange the returned code for an access token,
- *   3. call protected endpoints (/id and /balance) with that token.
+ *   3. call protected endpoints (/user and /balance) with that token.
  *
  * Dependency-free: plain curl + JSON, PHP 7.2+. (The old version depended on
  * adoy/PHP-OAuth2; that is no longer required.)
@@ -13,10 +13,11 @@
  * Register an app in the Gloebit merchant tools to get a consumer key/secret,
  * and set its OAuth redirect URI to match $REDIRECT_URI below.
  *
- * SCOPES: this example requests 'id balance' (read the user's identity and
- * gloebit balance). To actually charge a user's gloebits -- what a Blesta /
- * billing payment module needs -- you add the 'transact' scope and call
- * /transact. See README.md for the full scope list.
+ * SCOPES: this example requests 'user balance' (read the user's Gloebit id and
+ * gloebit balance). To charge a user's gloebits -- what a Blesta / billing
+ * payment module needs -- add the 'transact' scope and call /transact. Note: the
+ * old 'id' scope (and /id endpoint) is DEPRECATED and triggers a legacy
+ * "character" step in the authorize flow -- use 'user' for identity. See README.md.
  */
 
 // ---- Config -----------------------------------------------------------------
@@ -26,28 +27,27 @@ $CLIENT_ID     = getenv('GLOEBIT_CLIENT_ID')     ?: 'your-consumer-key';
 $CLIENT_SECRET = getenv('GLOEBIT_CLIENT_SECRET') ?: 'your-consumer-secret';
 $REDIRECT_URI  = getenv('GLOEBIT_REDIRECT_URI')  ?: 'http://localhost/gloebit-php-example.php';
 
-// Space-separated OAuth scopes. 'id' = read identity (/id); 'balance' = read
-// gloebit balance (/balance); add 'transact' to charge gloebits (/transact).
-// See README.md for the full list and what each grants.
-$SCOPE = 'id balance';
+// Space-separated OAuth scopes. 'user' = read the Gloebit user id (/user);
+// 'balance' = read gloebit balance (/balance); add 'transact' to charge gloebits
+// (/transact). The old 'id' scope is DEPRECATED -- do not use it (it triggers a
+// legacy character step). See README.md for the full list and what each grants.
+$SCOPE = 'user balance';
 
-// Your application's OWN identity for the end user being authorized:
+// Your application's OWN identity for the end user being authorized. Passing
+// these links your app-user to their Gloebit account (Gloebit's AppUser record) --
+// which is what transactions attribute to. (OpenSim passes the avatar this way.)
 //   $APP_USER_ID  -> sent as 'uid'. A STABLE identifier that is UNIQUE per
-//                    app-user (e.g. your Blesta client id). Gloebit keys the
-//                    app-user (its "character") on (this app, uid), so reusing
-//                    one value across users links the 2nd user to the 1st's
-//                    app-user and the authorization FAILS. Never hardcode a
-//                    shared constant in production -- use your per-user id.
+//                    app-user (e.g. your Blesta client id). The app-user is keyed
+//                    on (this app, uid), so reusing one value across users links
+//                    the 2nd user to the 1st's app-user and the authorization
+//                    FAILS. Never hardcode a shared constant in production.
 //   $APP_USER_NAME -> sent as 'user'. A display name for that app-user.
-// Passing both makes Gloebit auto-associate the app-user and SKIP its
-// interactive "create a character" step. (OpenSim passes the avatar this way.)
-// Omit them and Gloebit will prompt the user to create a character instead.
 $APP_USER_ID   = getenv('GLOEBIT_APP_USER_ID')   ?: 'example-app-user-id';
 $APP_USER_NAME = getenv('GLOEBIT_APP_USER_NAME') ?: 'Example App User';
 
 $AUTHORIZE_URL    = $GLOEBIT_BASE . '/oauth2/authorize';
 $ACCESS_TOKEN_URL = $GLOEBIT_BASE . '/oauth2/access-token';
-$ID_URL           = $GLOEBIT_BASE . '/id';
+$USER_URL         = $GLOEBIT_BASE . '/user';
 $BALANCE_URL      = $GLOEBIT_BASE . '/balance';
 
 // ---- Tiny curl helper (returns [http_status, body]) -------------------------
@@ -135,13 +135,13 @@ $authHeaders = array(
     'Authorization: Bearer ' . $accessToken,
     'Accept: application/json',
 );
-list($idStatus, $idBody)           = gloebit_http('GET', $ID_URL, $authHeaders);
+list($userStatus, $userBody)       = gloebit_http('GET', $USER_URL, $authHeaders);
 list($balanceStatus, $balanceBody) = gloebit_http('GET', $BALANCE_URL, $authHeaders);
 
 header('Content-Type: text/html; charset=utf-8');
 echo '<h3>Access token</h3><pre>'
    . htmlspecialchars(json_encode($token, JSON_PRETTY_PRINT)) . '</pre>';
-echo '<h3>Response from /id (HTTP ' . intval($idStatus) . ')</h3><pre>'
-   . htmlspecialchars($idBody) . '</pre>';
+echo '<h3>Response from /user (HTTP ' . intval($userStatus) . ')</h3><pre>'
+   . htmlspecialchars($userBody) . '</pre>';
 echo '<h3>Response from /balance (HTTP ' . intval($balanceStatus) . ')</h3><pre>'
    . htmlspecialchars($balanceBody) . '</pre>';
