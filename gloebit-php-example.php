@@ -75,19 +75,29 @@ function gloebit_fail($msg) {
     http_response_code(400);
     header('Content-Type: text/html; charset=utf-8');
     echo '<pre>Gloebit OAuth error: ' . htmlspecialchars($msg) . "\n";
-    echo '<a href="' . htmlspecialchars($_SERVER['PHP_SELF']) . '">Retry</a></pre>';
+    echo '<a href="' . htmlspecialchars(basename(__FILE__)) . '">Retry</a></pre>';
     exit;
 }
 
+// Fail gracefully on any uncaught exception (e.g. a curl network/TLS error thrown
+// by gloebit_http) instead of emitting a fatal with a file path / stack trace.
+set_exception_handler(function ($e) {
+    gloebit_fail($e->getMessage());
+});
+
 // ---- Flow -------------------------------------------------------------------
+// A session carries the OAuth 'state' across the redirect (CSRF defence).
+session_start();
+
 if (isset($_GET['error'])) {
     gloebit_fail($_GET['error']);
 }
 
 if (!isset($_GET['code'])) {
-    // Step 1: send the user to Gloebit to authorize.
-    // In real use, persist $state in the session and verify it on return (CSRF).
+    // Step 1: send the user to Gloebit to authorize. Stash a random 'state' in the
+    // session; we verify it on the way back to defend the callback against CSRF.
     $state = bin2hex(random_bytes(16));
+    $_SESSION['gloebit_oauth_state'] = $state;
     $params = array(
         'response_type' => 'code',
         'client_id'     => $CLIENT_ID,
@@ -101,6 +111,13 @@ if (!isset($_GET['code'])) {
     );
     header('Location: ' . $AUTHORIZE_URL . '?' . http_build_query($params));
     exit;
+}
+
+// Back from authorize with ?code=... -- verify 'state' before trusting the code.
+$expectedState = isset($_SESSION['gloebit_oauth_state']) ? $_SESSION['gloebit_oauth_state'] : null;
+unset($_SESSION['gloebit_oauth_state']);   // one-time use
+if (!$expectedState || !isset($_GET['state']) || !hash_equals($expectedState, $_GET['state'])) {
+    gloebit_fail('state mismatch -- possible CSRF or an expired session. Start over.');
 }
 
 // Step 2: exchange the authorization code for an access token.
@@ -126,6 +143,8 @@ list($status, $tokenBody) = gloebit_http(
 
 $token = json_decode($tokenBody, true);
 if ($status !== 200 || !is_array($token) || empty($token['access_token'])) {
+    // Shows the raw server error so you can debug locally. In production, log this
+    // server-side and show the user a generic "authorization failed" message.
     gloebit_fail('token exchange failed (HTTP ' . $status . '): ' . $tokenBody);
 }
 $accessToken = $token['access_token'];

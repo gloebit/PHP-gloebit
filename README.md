@@ -57,7 +57,8 @@ How it works
 
 1. **Authorize** — redirect to `GET /oauth2/authorize` with `response_type=code`,
    your `client_id`, `redirect_uri`, `scope`, a `state`, and the app-user's
-   `user`/`uid` (see below).
+   `user`/`uid` (see below). The `state` is stored in the session and verified on
+   return (CSRF protection); Gloebit echoes it back on the redirect.
 2. **Token** — `POST /oauth2/access-token` with `grant_type=authorization_code`
    and the returned `code`. Gloebit reads `client_id`, `client_secret`, and
    `scope` from the **POST body** (not an HTTP Basic header).
