@@ -112,8 +112,8 @@ settlement a payment integration (e.g. a Blesta gateway) needs:
 2. **Charge** — `POST /v2/transact` with a **JSON body** and the bearer token. The
    synchronous response only means the charge was **accepted / queued**, *not*
    settled.
-3. **Callbacks** — Gloebit's transaction processor then calls back to the three
-   hold URLs you supplied, driving a two-phase commit:
+3. **Callbacks** — Gloebit's transaction processor then issues an **HTTP GET** to
+   each of the three hold URLs you supplied, driving a two-phase commit:
    - `enact` — place the hold / begin delivery (must be idempotent),
    - `consume` — the charge **settled**; this is where you activate what was
      bought (e.g. extend a month of hosting),
@@ -123,7 +123,9 @@ settlement a payment integration (e.g. a Blesta gateway) needs:
    `[false, "pending"]` to ask the processor to **retry**, or `[false, "reason"]`
    for a permanent failure. Honor a callback only if its `transaction-id` matches
    one you initiated (the example keys this to a small record; a real integration
-   uses its order/invoice in a database).
+   uses its order/invoice in a database). Make the `consume` activation idempotent
+   (it can be retried), and log/persist each outcome so a dropped callback can be
+   reconciled — a lost `consume` is a paid-but-unactivated order.
 
 The one script plays three roles, distinguished by request params: a Gloebit
 callback (`?gbcb=1&state=…&id=…`), the return from authorize (`?code=…`), and the

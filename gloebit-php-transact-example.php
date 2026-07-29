@@ -11,9 +11,9 @@
  *               'app_user_id' (and 'user_id_on_app'); the charge step needs both.
  *   2. CHARGE - POST /v2/transact (a JSON body) with the access token. The
  *               SYNCHRONOUS response only means "accepted / queued" -- NOT settled.
- *   3. CALLBACKS - Gloebit's transaction processor then calls back to the hold URLs
- *               we supplied, to drive the charge: enact -> consume (settled) or
- *               enact -> cancel (rolled back). 'consume' is the authoritative
+ *   3. CALLBACKS - Gloebit's transaction processor then issues an HTTP GET to each
+ *               hold URL we supplied, to drive the charge: enact -> consume (settled)
+ *               or enact -> cancel (rolled back). 'consume' is the authoritative
  *               "payment completed" signal -- that is where a real integration
  *               ACTIVATES the purchased service (e.g. extends a month of hosting).
  *
@@ -25,8 +25,9 @@
  * IMPORTANT (testing): the hold/callback URLs must be PUBLICLY reachable -- Gloebit
  * rejects localhost/private IPs. `php -S localhost:8000` is fine for auth and for
  * sending the charge, but the enact/consume/cancel callbacks will NOT reach a local
- * server. For end-to-end callback testing, expose this script via a public tunnel
- * (e.g. ngrok) and set GLOEBIT_REDIRECT_URI to that public URL.
+ * server. For end-to-end callback testing, expose this script at a public HTTPS URL --
+ * e.g. a Cloudflare Tunnel (`cloudflared tunnel --url http://localhost:8000`) -- and
+ * set GLOEBIT_REDIRECT_URI to that public URL.
  *
  * NOTE: charging moves real gloebits. Use a test app and a small amount.
  */
@@ -65,9 +66,12 @@ function gloebit_http($method, $url, array $headers = array(), $body = null) {
     }
     $resp = curl_exec($ch);
     if ($resp === false) {
-        throw new RuntimeException('curl error requesting ' . $url . ': ' . curl_error($ch));
+        $err = curl_error($ch);
+        throw new RuntimeException('curl error requesting ' . $url . ': ' . $err);
     }
     $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    // No curl_close(): it's a no-op since PHP 8.0 and deprecated in 8.5; the
+    // handle is freed automatically when $ch goes out of scope.
     return array($status, $resp);
 }
 
@@ -117,8 +121,8 @@ function gloebit_uuid4() {
     return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($d), 4));
 }
 
-// A callback URL for this script. WE choose the format; Gloebit's processor POSTs
-// to exactly the URL we supply, so we tag it with a marker + the state + txn id.
+// A callback URL for this script. WE choose the format; Gloebit's processor issues an
+// HTTP GET to exactly the URL we supply, so we tag it with a marker + the state + txn id.
 function gloebit_callback_url($state, $txnId) {
     global $REDIRECT_URI;
     $sep = (strpos($REDIRECT_URI, '?') === false) ? '?' : '&';
@@ -137,42 +141,65 @@ function gloebit_callback_url($state, $txnId) {
 //   [false, "reason"]   -> permanent failure
 // =============================================================================
 if (isset($_GET['gbcb'])) {
+    http_response_code(200);   // the reply contract below is only meaningful as a 200
     header('Content-Type: application/json');
     $id    = isset($_GET['id'])    ? $_GET['id']    : '';
     $state = isset($_GET['state']) ? $_GET['state'] : '';
 
+    // Log every callback (id + state). A real integration persists the enact/consume/
+    // cancel outcome keyed to its order/invoice so it can reconcile against Gloebit if a
+    // callback is ever dropped -- a lost 'consume' is a paid-but-unactivated order.
+    error_log("gloebit callback: state=$state id=$id");
+
     // Only act on a charge we actually initiated.
-    if (gloebit_txn_load($id) === null) {
+    $rec = gloebit_txn_load($id);
+    if ($rec === null) {
+        error_log("gloebit callback: unknown transaction id=$id");
         echo json_encode(array(false, 'unknown transaction'));
         exit;
     }
+    $current = isset($rec['status']) ? $rec['status'] : '';
 
-    switch ($state) {
-        case 'enact':
-            // First phase: place the hold / begin delivery. For a pure payment there
-            // is nothing to deliver, so we just record the hold. MUST be idempotent
-            // (the processor may retry enact). Return [false, "pending"] here if your
-            // own provisioning is momentarily unavailable and you want a retry.
-            gloebit_txn_set_status($id, 'enacted');
-            echo json_encode(array(true));
-            break;
+    // Provisioning can fail; keep the JSON-array reply contract intact by turning any
+    // exception into a retriable [false, "pending"] (still HTTP 200) rather than letting
+    // the global exception handler emit HTML/400, which the processor can't interpret.
+    try {
+        switch ($state) {
+            case 'enact':
+                // First phase: place the hold / begin delivery. For a pure payment there
+                // is nothing to deliver, so we just record the hold. MUST be idempotent
+                // (the processor may retry enact). Return [false, "pending"] if your own
+                // provisioning is momentarily unavailable and you want a retry.
+                gloebit_txn_set_status($id, 'enacted');
+                echo json_encode(array(true));
+                break;
 
-        case 'consume':
-            // Second phase: the charge SETTLED. This is where a real integration
-            // activates what was bought -- e.g. extend the subscription / mark the
-            // invoice paid. Do that here, then acknowledge.
-            gloebit_txn_set_status($id, 'consumed');   // <- your "activate service" hook
-            echo json_encode(array(true));
-            break;
+            case 'consume':
+                // Second phase: the charge SETTLED. This is where a real integration
+                // activates what was bought -- e.g. extend the subscription / mark the
+                // invoice paid. Make the activation IDEMPOTENT: consume can be delivered
+                // more than once (retries), so skip the hook if already consumed.
+                if ($current !== 'consumed') {
+                    gloebit_txn_set_status($id, 'consumed');   // <- your "activate service" hook
+                }
+                echo json_encode(array(true));
+                break;
 
-        case 'cancel':
-            // The charge was rolled back. Release any hold and do NOT activate.
-            gloebit_txn_set_status($id, 'canceled');
-            echo json_encode(array(true));
-            break;
+            case 'cancel':
+                // The charge was rolled back. Release any hold and do NOT activate.
+                // Never roll back an already-settled (consumed) charge.
+                if ($current !== 'consumed') {
+                    gloebit_txn_set_status($id, 'canceled');
+                }
+                echo json_encode(array(true));
+                break;
 
-        default:
-            echo json_encode(array(false, 'unknown state'));
+            default:
+                echo json_encode(array(false, 'unknown state'));
+        }
+    } catch (Throwable $e) {
+        error_log('gloebit callback error id=' . $id . ': ' . $e->getMessage());
+        echo json_encode(array(false, 'pending'));   // transient -- ask the processor to retry
     }
     exit;
 }
@@ -195,49 +222,81 @@ if (isset($_GET['do_charge'])) {
     $appUserId    = isset($_SESSION['gloebit_app_user_id'])   ? $_SESSION['gloebit_app_user_id']   : null;
     $userIdOnApp  = isset($_SESSION['gloebit_user_id_on_app']) ? $_SESSION['gloebit_user_id_on_app'] : $APP_USER_ID;
 
-    // Build the charge. transaction-id is a fresh UUID we own; we record it before
-    // sending so the callbacks (which arrive asynchronously) can be trusted.
-    $txnId = gloebit_uuid4();
-    gloebit_txn_store($txnId, array('status' => 'submitted', 'amount' => $CHARGE_AMOUNT));
+    // v2 requires app-user-id (validated against the token). If the token didn't return
+    // one, fail clearly rather than sending null and getting an opaque server rejection.
+    if (empty($appUserId)) {
+        gloebit_fail('token returned no app_user_id -- re-authorize before charging.');
+    }
+    // A charge moves real gloebits: require a positive whole-number amount.
+    if ($CHARGE_AMOUNT < 1) {
+        gloebit_fail('GLOEBIT_CHARGE_AMOUNT must be a positive whole number.');
+    }
 
-    $transaction = array(
-        'version'                 => 1,
-        'application-key'         => $CLIENT_ID,
-        'request-created'         => time(),
-        'transaction-id'          => $txnId,
-        'username-on-application'  => $APP_USER_NAME,
-        // Identify the payer -- both must match the token's user (v2 validates this):
-        'app-user-id'             => $appUserId,     // from the token response
-        'buyer-id-on-application' => $userIdOnApp,   // the 'uid' used at authorize
-        // What is being charged:
-        'gloebit-balance-change'  => $CHARGE_AMOUNT, // whole gloebits to charge
-        'asset-code'              => $ASSET_CODE,
-        'asset-quantity'          => 1,
-        // Two-phase-commit callbacks (must be publicly reachable -- see file header):
-        'asset-enact-hold-url'    => gloebit_callback_url('enact',   $txnId),
-        'asset-consume-hold-url'  => gloebit_callback_url('consume', $txnId),
-        'asset-cancel-hold-url'   => gloebit_callback_url('cancel',  $txnId),
-    );
+    // One charge per authorization. A browser refresh / back-button re-hits ?do_charge=1;
+    // minting a new transaction-id each time would charge AGAIN. So we reuse the first
+    // transaction-id for this session and don't re-send on a repeat hit. (A real
+    // integration derives the transaction-id from its order/invoice so retries are
+    // naturally idempotent -- the server de-dupes on transaction-id.)
+    $alreadyCharged = !empty($_SESSION['gloebit_charge_txn']);
+    $txnId = $alreadyCharged ? $_SESSION['gloebit_charge_txn'] : gloebit_uuid4();
+    $status = null;
+    $body   = null;
 
-    list($status, $body) = gloebit_http(
-        'POST',
-        $TRANSACT_URL,
-        array(
-            'Authorization: Bearer ' . $accessToken,
-            'Content-Type: application/json',
-            'Accept: application/json',
-        ),
-        json_encode($transaction)   // /v2/transact expects a JSON body
-    );
+    if (!$alreadyCharged) {
+        // Record the txn before sending so the async callbacks can be tied back to it.
+        gloebit_txn_store($txnId, array('status' => 'submitted', 'amount' => $CHARGE_AMOUNT));
+        $_SESSION['gloebit_charge_txn'] = $txnId;
+
+        $transaction = array(
+            'version'                 => 1,
+            'application-key'         => $CLIENT_ID,
+            'request-created'         => time(),
+            'transaction-id'          => $txnId,
+            'username-on-application'  => $APP_USER_NAME,
+            // Identify the payer -- both must match the token's user (v2 validates this):
+            'app-user-id'             => $appUserId,     // from the token response
+            'buyer-id-on-application' => $userIdOnApp,   // the 'uid' used at authorize
+            // What is being charged:
+            'gloebit-balance-change'  => $CHARGE_AMOUNT, // whole gloebits to charge
+            'asset-code'              => $ASSET_CODE,
+            'asset-quantity'          => 1,
+            // Two-phase-commit callbacks (must be publicly reachable -- see file header):
+            'asset-enact-hold-url'    => gloebit_callback_url('enact',   $txnId),
+            'asset-consume-hold-url'  => gloebit_callback_url('consume', $txnId),
+            'asset-cancel-hold-url'   => gloebit_callback_url('cancel',  $txnId),
+        );
+
+        list($status, $body) = gloebit_http(
+            'POST',
+            $TRANSACT_URL,
+            array(
+                'Authorization: Bearer ' . $accessToken,
+                'Content-Type: application/json',
+                'Accept: application/json',
+            ),
+            json_encode($transaction)   // /v2/transact expects a JSON body
+        );
+    }
 
     header('Content-Type: text/html; charset=utf-8');
-    echo '<h3>Charge submitted (HTTP ' . intval($status) . ')</h3>';
+    if ($alreadyCharged) {
+        echo '<h3>Charge already submitted</h3>';
+        echo '<p>A charge for this session was already sent; refreshing does not charge again.</p>';
+    } else {
+        $ok = ($status >= 200 && $status < 300);
+        echo '<h3>Charge ' . ($ok ? 'submitted' : 'FAILED') . ' (HTTP ' . intval($status) . ')</h3>';
+        if (!$ok) {
+            echo '<p><strong>The charge was not accepted</strong> -- see the response below.</p>';
+        }
+        echo '<pre>' . htmlspecialchars((string)$body) . '</pre>';
+        if ($ok) {
+            echo '<p>This means the charge was <em>accepted / queued</em>. The authoritative '
+               . 'result arrives asynchronously via the <code>consume</code> (settled) or '
+               . '<code>cancel</code> (rolled back) callback to this script -- which only '
+               . 'works if this URL is publicly reachable.</p>';
+        }
+    }
     echo '<p>transaction-id: <code>' . htmlspecialchars($txnId) . '</code></p>';
-    echo '<pre>' . htmlspecialchars($body) . '</pre>';
-    echo '<p>The response above means the charge was <em>accepted / queued</em>. The '
-       . 'authoritative result arrives asynchronously via the <code>consume</code> '
-       . '(settled) or <code>cancel</code> (rolled back) callback to this script -- '
-       . 'which only works if this URL is publicly reachable.</p>';
     $rec = gloebit_txn_load($txnId);
     echo '<p>Local status for this transaction: <strong>'
        . htmlspecialchars($rec ? $rec['status'] : 'unknown')
