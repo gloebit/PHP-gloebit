@@ -9,10 +9,9 @@ access token, and calls two protected endpoints (`/user` and `/balance`) with
 that token. It's dependency-free (plain `curl` + JSON) and targets **production**
 (`https://www.gloebit.com`).
 
-> This example is a **base to build on**. It covers authentication and two
-> read-only calls. Charging a user's gloebits — what a billing integration such
-> as a **Blesta payment module** needs — adds the `transact` scope and the
-> transaction API on top of this same flow (see "Next: payments" below).
+`gloebit-php-transact-example.php` builds on that flow to **charge** a user's
+gloebits — what a billing integration such as a **Blesta payment module** needs.
+See "Charging gloebits" below.
 
 Requirements
 ------------
@@ -101,14 +100,46 @@ This is how the OpenSim module passes the avatar. It establishes the app-user li
 that transactions attribute to; it is **not** what controls the character prompt
 (that's the deprecated `id` scope — see above).
 
-Next: payments (transaction API)
---------------------------------
+Charging gloebits (`gloebit-php-transact-example.php`)
+------------------------------------------------------
 
-To actually move gloebits (e.g. a Blesta payment gateway that charges a customer
-for hosting), add the `transact` scope and use the access token with Gloebit's
-**transaction API** (`/transact`) to authorize and enact a charge. That layer is
-not in this example yet; it will be added as a small reusable client on top of
-this same flow.
+`gloebit-php-transact-example.php` builds on the auth flow above to **charge** a
+user's gloebits via `POST /v2/transact`. It demonstrates the full two-phase
+settlement a payment integration (e.g. a Blesta gateway) needs:
+
+1. **Authorize** with scope `user balance transact`. The token response returns
+   `app_user_id` and `user_id_on_app` — the two payer identifiers the charge needs.
+2. **Charge** — `POST /v2/transact` with a **JSON body** and the bearer token. The
+   synchronous response only means the charge was **accepted / queued**, *not*
+   settled.
+3. **Callbacks** — Gloebit's transaction processor then calls back to the three
+   hold URLs you supplied, driving a two-phase commit:
+   - `enact` — place the hold / begin delivery (must be idempotent),
+   - `consume` — the charge **settled**; this is where you activate what was
+     bought (e.g. extend a month of hosting),
+   - `cancel` — rolled back; release the hold and do **not** activate.
+
+   Each callback must reply **HTTP 200** with a JSON array: `[true]` on success,
+   `[false, "pending"]` to ask the processor to **retry**, or `[false, "reason"]`
+   for a permanent failure. Honor a callback only if its `transaction-id` matches
+   one you initiated (the example keys this to a small record; a real integration
+   uses its order/invoice in a database).
+
+The one script plays three roles, distinguished by request params: a Gloebit
+callback (`?gbcb=1&state=…&id=…`), the return from authorize (`?code=…`), and the
+user confirming the charge (`?do_charge=1`). Extra config env vars:
+`GLOEBIT_CHARGE_AMOUNT` (whole gloebits, default `1`) and `GLOEBIT_ASSET_CODE`
+(a description of the purchase).
+
+### Testing note — the callbacks need a PUBLIC URL
+
+Gloebit rejects hold URLs pointing at localhost / private IPs, so the
+`enact`/`consume`/`cancel` callbacks can't reach a plain `php -S localhost`. To
+exercise the full lifecycle, expose the script at a public HTTPS URL — e.g. a
+Cloudflare Tunnel (`cloudflared tunnel --url http://localhost:8000`) — set
+`GLOEBIT_REDIRECT_URI` to that public URL, and add it to the app's permitted
+callback URI prefixes. Charging moves **real gloebits**, so use a test app and a
+small `GLOEBIT_CHARGE_AMOUNT`.
 
 See the Gloebit developer/integration docs at <https://dev.gloebit.com/> for the
 full API reference.
