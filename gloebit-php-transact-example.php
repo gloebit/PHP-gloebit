@@ -232,11 +232,12 @@ if (isset($_GET['do_charge'])) {
         gloebit_fail('GLOEBIT_CHARGE_AMOUNT must be a positive whole number.');
     }
 
-    // One charge per authorization. A browser refresh / back-button re-hits ?do_charge=1;
-    // minting a new transaction-id each time would charge AGAIN. So we reuse the first
-    // transaction-id for this session and don't re-send on a repeat hit. (A real
-    // integration derives the transaction-id from its order/invoice so retries are
-    // naturally idempotent -- the server de-dupes on transaction-id.)
+    // The transaction-id is the server's IDEMPOTENCY KEY: the same id de-dupes to a single
+    // charge, a new id is a new charge. So a given charge must use a STABLE id, NOT a fresh
+    // one per request -- otherwise a browser refresh / back-button re-hits ?do_charge=1 and
+    // charges AGAIN. This demo pins one id in the session (a fresh authorization clears it,
+    // so you can run another charge). A real integration derives the transaction-id from its
+    // order/invoice, which makes retries naturally idempotent and refresh-safe.
     $alreadyCharged = !empty($_SESSION['gloebit_charge_txn']);
     $txnId = $alreadyCharged ? $_SESSION['gloebit_charge_txn'] : gloebit_uuid4();
     $status = null;
@@ -355,6 +356,9 @@ if ($status !== 200 || !is_array($token) || empty($token['access_token'])) {
 $_SESSION['gloebit_access_token']   = $token['access_token'];
 $_SESSION['gloebit_app_user_id']    = isset($token['app_user_id'])   ? $token['app_user_id']   : null;
 $_SESSION['gloebit_user_id_on_app'] = isset($token['user_id_on_app']) ? $token['user_id_on_app'] : $APP_USER_ID;
+// A fresh authorization permits a new charge -- clear ROLE 2's one-charge-per-
+// authorization guard so re-authorizing lets you run the charge again.
+unset($_SESSION['gloebit_charge_txn']);
 
 // Show a confirmation page instead of charging automatically.
 header('Content-Type: text/html; charset=utf-8');
