@@ -122,9 +122,8 @@ function gloebit_uuid4() {
 }
 
 // Signature for the callback that requests $state for $txnId: an HMAC-SHA256 keyed with
-// the app's secret, which only this script and Gloebit know. The transaction-id alone is
-// not proof the request came from Gloebit -- the buyer can see it -- so each callback URL
-// carries this signature and the handler checks it.
+// the app's secret, which only this script and Gloebit know. Each callback URL carries it,
+// so the handler acts only on URLs this script built.
 function gloebit_callback_sig($state, $txnId) {
     global $CLIENT_SECRET;
     $message = "gloebit-hold-callback\n" . strtolower($txnId) . "\n" . $state;
@@ -164,8 +163,25 @@ if (isset($_GET['gbcb'])) {
     // callback is ever dropped -- a lost 'consume' is a paid-but-unactivated order.
     error_log("gloebit callback: state=$state id=$id");
 
-    // Only act on a URL we built: anyone who knows the transaction-id could otherwise
-    // drive it (e.g. call consume to activate an order that was never paid).
+    // Cancel needs no signature and always succeeds unless the charge already settled.
+    // Gloebit retries a refused cancel until it succeeds, and a cancel never activates
+    // anything, so refusing one (e.g. after the app secret is rotated) only wedges it.
+    if ($state === 'cancel') {
+        $rec = gloebit_txn_load($id);
+        $current = ($rec !== null && isset($rec['status'])) ? $rec['status'] : '';
+        try {
+            if ($rec !== null && $current !== 'consumed') {   // never roll back a settled charge
+                gloebit_txn_set_status($id, 'canceled');
+            }
+            echo json_encode(array(true));
+        } catch (Throwable $e) {
+            error_log('gloebit callback error id=' . $id . ': ' . $e->getMessage());
+            echo json_encode(array(false, 'pending'));   // transient -- ask the processor to retry
+        }
+        exit;
+    }
+
+    // Enact and consume: act only on a URL we built.
     if ($id === '' || $state === '' || !hash_equals(gloebit_callback_sig($state, $id), strtolower($sig))) {
         error_log("gloebit callback: bad or missing signature id=$id state=$state");
         echo json_encode(array(false, 'forbidden'));
@@ -181,6 +197,12 @@ if (isset($_GET['gbcb'])) {
     }
     $current = isset($rec['status']) ? $rec['status'] : '';
 
+    // A canceled charge stays canceled: never re-open or activate it.
+    if ($current === 'canceled') {
+        echo json_encode(array(false, 'canceled'));
+        exit;
+    }
+
     // Provisioning can fail; keep the JSON-array reply contract intact by turning any
     // exception into a retriable [false, "pending"] (still HTTP 200) rather than letting
     // the global exception handler emit HTML/400, which the processor can't interpret.
@@ -191,11 +213,6 @@ if (isset($_GET['gbcb'])) {
                 // is nothing to deliver, so we just record the hold. MUST be idempotent
                 // (the processor may retry enact). Return [false, "pending"] if your own
                 // provisioning is momentarily unavailable and you want a retry.
-                // A canceled charge stays canceled: never re-open it.
-                if ($current === 'canceled') {
-                    echo json_encode(array(false, 'canceled'));
-                    break;
-                }
                 if ($current !== 'consumed') {
                     gloebit_txn_set_status($id, 'enacted');
                 }
@@ -207,22 +224,8 @@ if (isset($_GET['gbcb'])) {
                 // activates what was bought -- e.g. extend the subscription / mark the
                 // invoice paid. Make the activation IDEMPOTENT: consume can be delivered
                 // more than once (retries), so skip the hook if already consumed.
-                // Never activate a canceled charge.
-                if ($current === 'canceled') {
-                    echo json_encode(array(false, 'canceled'));
-                    break;
-                }
                 if ($current !== 'consumed') {
                     gloebit_txn_set_status($id, 'consumed');   // <- your "activate service" hook
-                }
-                echo json_encode(array(true));
-                break;
-
-            case 'cancel':
-                // The charge was rolled back. Release any hold and do NOT activate.
-                // Never roll back an already-settled (consumed) charge.
-                if ($current !== 'consumed') {
-                    gloebit_txn_set_status($id, 'canceled');
                 }
                 echo json_encode(array(true));
                 break;
