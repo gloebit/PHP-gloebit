@@ -127,8 +127,8 @@ settlement a payment integration (e.g. a Blesta gateway) needs:
    `transaction-id` you initiated (the example keys this to a small record; a real
    integration uses its order/invoice in a database). Once a charge is canceled,
    refuse a later `enact` or `consume` for it. Always answer `cancel` with `[true]`
-   unless the charge already settled: Gloebit retries a refused cancel until it
-   succeeds. Make the `consume` activation idempotent
+   (but never roll back a charge that already settled): Gloebit retries a refused
+   cancel until it succeeds. Make the `consume` activation idempotent
    (it can be retried), and log/persist each outcome so a dropped callback can be
    reconciled — a lost `consume` is a paid-but-unactivated order.
 

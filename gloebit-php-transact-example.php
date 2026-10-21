@@ -163,7 +163,7 @@ if (isset($_GET['gbcb'])) {
     // callback is ever dropped -- a lost 'consume' is a paid-but-unactivated order.
     error_log("gloebit callback: state=$state id=$id");
 
-    // Cancel needs no signature and always succeeds unless the charge already settled.
+    // Cancel needs no signature and always answers [true]; it never rolls back a settled charge.
     // Gloebit retries a refused cancel until it succeeds, and a cancel never activates
     // anything, so refusing one (e.g. after the app secret is rotated) only wedges it.
     if ($state === 'cancel') {
