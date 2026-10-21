@@ -121,14 +121,19 @@ settlement a payment integration (e.g. a Blesta gateway) needs:
 
    Each callback must reply **HTTP 200** with a JSON array: `[true]` on success,
    `[false, "pending"]` to ask the processor to **retry**, or `[false, "reason"]`
-   for a permanent failure. Honor a callback only if its `transaction-id` matches
-   one you initiated (the example keys this to a small record; a real integration
-   uses its order/invoice in a database). Make the `consume` activation idempotent
+   for a permanent failure. **Sign each hold URL** and honor a callback only if its
+   signature checks out: the `transaction-id` alone is not proof the request came
+   from Gloebit. The example appends `sig=` (an HMAC-SHA256 of the transaction id
+   and state, keyed with your app secret) and checks it with `hash_equals`. Also
+   honor a callback only if its `transaction-id` matches one you initiated (the
+   example keys this to a small record; a real integration uses its order/invoice
+   in a database), and once a charge is canceled, refuse a later `enact` or
+   `consume` for it. Make the `consume` activation idempotent
    (it can be retried), and log/persist each outcome so a dropped callback can be
    reconciled — a lost `consume` is a paid-but-unactivated order.
 
 The one script plays three roles, distinguished by request params: a Gloebit
-callback (`?gbcb=1&state=…&id=…`), the return from authorize (`?code=…`), and the
+callback (`?gbcb=1&state=…&id=…&sig=…`), the return from authorize (`?code=…`), and the
 user confirming the charge (`?do_charge=1`). Extra config env vars:
 `GLOEBIT_CHARGE_AMOUNT` (whole gloebits, default `1`) and `GLOEBIT_ASSET_CODE`
 (a description of the purchase).

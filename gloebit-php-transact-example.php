@@ -18,7 +18,7 @@
  *               ACTIVATES the purchased service (e.g. extends a month of hosting).
  *
  * This one script plays all three roles, distinguished by request params:
- *   - ?gbcb=1&state=<enact|consume|cancel>&id=<txn>  -> a Gloebit callback (role 3)
+ *   - ?gbcb=1&state=<enact|consume|cancel>&id=<txn>&sig=<hmac> -> a Gloebit callback (role 3)
  *   - ?code=... (+ oauth state)                      -> return from authorize (role 1)
  *   - ?do_charge=1                                   -> user confirmed the charge (role 2)
  *
@@ -121,21 +121,33 @@ function gloebit_uuid4() {
     return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($d), 4));
 }
 
+// Signature for the callback that requests $state for $txnId: an HMAC-SHA256 keyed with
+// the app's secret, which only this script and Gloebit know. The transaction-id alone is
+// not proof the request came from Gloebit -- the buyer can see it -- so each callback URL
+// carries this signature and the handler checks it.
+function gloebit_callback_sig($state, $txnId) {
+    global $CLIENT_SECRET;
+    $message = "gloebit-hold-callback\n" . strtolower($txnId) . "\n" . $state;
+    return hash_hmac('sha256', $message, $CLIENT_SECRET);
+}
+
 // A callback URL for this script. WE choose the format; Gloebit's processor issues an
-// HTTP GET to exactly the URL we supply, so we tag it with a marker + the state + txn id.
+// HTTP GET to exactly the URL we supply, so we tag it with a marker, the state, the txn
+// id, and the signature above.
 function gloebit_callback_url($state, $txnId) {
     global $REDIRECT_URI;
     $sep = (strpos($REDIRECT_URI, '?') === false) ? '?' : '&';
     return $REDIRECT_URI . $sep . 'gbcb=1&state=' . rawurlencode($state)
-         . '&id=' . rawurlencode($txnId);
+         . '&id=' . rawurlencode($txnId)
+         . '&sig=' . gloebit_callback_sig($state, $txnId);
 }
 
 // =============================================================================
 // ROLE 3 -- Gloebit callback (enact / consume / cancel). Must run first: this is
 // Gloebit's transaction processor calling us, with no session and no OAuth.
 //
-// Contract (mirrors the OpenSim module's handler): read 'id' and 'state', do the
-// work, and reply HTTP 200 application/json with a JSON array:
+// Contract (mirrors the OpenSim module's handler): read 'id' and 'state', check 'sig',
+// do the work, and reply HTTP 200 application/json with a JSON array:
 //   [true]              -> this stage succeeded
 //   [false, "pending"]  -> temporary failure; the processor will RETRY
 //   [false, "reason"]   -> permanent failure
@@ -143,13 +155,22 @@ function gloebit_callback_url($state, $txnId) {
 if (isset($_GET['gbcb'])) {
     http_response_code(200);   // the reply contract below is only meaningful as a 200
     header('Content-Type: application/json');
-    $id    = isset($_GET['id'])    ? $_GET['id']    : '';
-    $state = isset($_GET['state']) ? $_GET['state'] : '';
+    $id    = isset($_GET['id'])    ? (string)$_GET['id']    : '';
+    $state = isset($_GET['state']) ? (string)$_GET['state'] : '';
+    $sig   = isset($_GET['sig'])   ? (string)$_GET['sig']   : '';
 
     // Log every callback (id + state). A real integration persists the enact/consume/
     // cancel outcome keyed to its order/invoice so it can reconcile against Gloebit if a
     // callback is ever dropped -- a lost 'consume' is a paid-but-unactivated order.
     error_log("gloebit callback: state=$state id=$id");
+
+    // Only act on a URL we built: anyone who knows the transaction-id could otherwise
+    // drive it (e.g. call consume to activate an order that was never paid).
+    if ($id === '' || $state === '' || !hash_equals(gloebit_callback_sig($state, $id), strtolower($sig))) {
+        error_log("gloebit callback: bad or missing signature id=$id state=$state");
+        echo json_encode(array(false, 'forbidden'));
+        exit;
+    }
 
     // Only act on a charge we actually initiated.
     $rec = gloebit_txn_load($id);
@@ -170,7 +191,14 @@ if (isset($_GET['gbcb'])) {
                 // is nothing to deliver, so we just record the hold. MUST be idempotent
                 // (the processor may retry enact). Return [false, "pending"] if your own
                 // provisioning is momentarily unavailable and you want a retry.
-                gloebit_txn_set_status($id, 'enacted');
+                // A canceled charge stays canceled: never re-open it.
+                if ($current === 'canceled') {
+                    echo json_encode(array(false, 'canceled'));
+                    break;
+                }
+                if ($current !== 'consumed') {
+                    gloebit_txn_set_status($id, 'enacted');
+                }
                 echo json_encode(array(true));
                 break;
 
@@ -179,6 +207,11 @@ if (isset($_GET['gbcb'])) {
                 // activates what was bought -- e.g. extend the subscription / mark the
                 // invoice paid. Make the activation IDEMPOTENT: consume can be delivered
                 // more than once (retries), so skip the hook if already consumed.
+                // Never activate a canceled charge.
+                if ($current === 'canceled') {
+                    echo json_encode(array(false, 'canceled'));
+                    break;
+                }
                 if ($current !== 'consumed') {
                     gloebit_txn_set_status($id, 'consumed');   // <- your "activate service" hook
                 }
